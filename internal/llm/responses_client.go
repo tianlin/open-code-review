@@ -9,9 +9,12 @@ import (
 	"io"
 	"net/http"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 )
+
+const maxResponsesErrorBodyLen = 8192
 
 var (
 	bearerTokenRe         = regexp.MustCompile(`(?i)Bearer\s+[A-Za-z0-9._~+/=-]+`)
@@ -80,7 +83,7 @@ func (c *ResponsesClient) CompletionsWithCtx(ctx context.Context, req ChatReques
 		if err != nil {
 			return nil, err
 		}
-		return nil, fmt.Errorf("responses API returned %s: %s", httpResp.Status, redactSensitiveString(string(respBody)))
+		return nil, fmt.Errorf("responses API returned %s: %s", httpResp.Status, sanitizeHTTPErrorBody(string(respBody)))
 	}
 
 	if strings.Contains(strings.ToLower(httpResp.Header.Get("Content-Type")), "text/event-stream") {
@@ -108,6 +111,9 @@ func (c *ResponsesClient) buildResponsesBody(model string, req ChatRequest) (map
 		"input":        input,
 		"store":        false,
 		"stream":       strings.EqualFold(c.cfg.AuthMode, "chatgpt"),
+	}
+	if strings.EqualFold(c.cfg.AuthMode, "chatgpt") {
+		body["include"] = []string{"reasoning.encrypted_content"}
 	}
 	if req.MaxTokens > 0 && !strings.EqualFold(c.cfg.AuthMode, "chatgpt") {
 		body["max_output_tokens"] = req.MaxTokens
@@ -220,9 +226,6 @@ func mapResponsesResponse(raw []byte) (*ChatResponse, error) {
 	if err := json.Unmarshal(raw, &parsed); err != nil {
 		return nil, fmt.Errorf("parse responses response: %w", err)
 	}
-	if err := validateResponsesStatus(parsed.Status, parsed.Error, parsed.IncompleteDetails); err != nil {
-		return nil, err
-	}
 
 	var textParts []string
 	if parsed.OutputText != "" {
@@ -258,6 +261,9 @@ func mapResponsesResponse(raw []byte) (*ChatResponse, error) {
 				},
 			})
 		}
+	}
+	if err := validateResponsesStatus(parsed.Status, parsed.Error, parsed.IncompleteDetails, len(textParts) > 0 || len(toolCalls) > 0 || len(parsed.RawOutput) > 0); err != nil {
+		return nil, err
 	}
 
 	var contentPtr *string
@@ -301,6 +307,8 @@ func mapResponsesStreamReader(r io.Reader) (*ChatResponse, error) {
 	toolCallsByID := make(map[string]*ToolCall)
 	itemIDToCallID := make(map[string]string)
 	var toolCallOrder []string
+	rawOutputByID := make(map[string]map[string]any)
+	var rawOutputOrder []string
 
 	addToolCallID := func(id string) {
 		if id == "" {
@@ -369,6 +377,57 @@ func mapResponsesStreamReader(r io.Reader) (*ChatResponse, error) {
 		addToolCallID(id)
 		return toolCallsByID[id]
 	}
+	rawOutputID := func(item map[string]any) string {
+		if id, _ := item["id"].(string); id != "" {
+			return id
+		}
+		if callID, _ := item["call_id"].(string); callID != "" {
+			return callID
+		}
+		return "raw_" + strconv.Itoa(len(rawOutputOrder)+1)
+	}
+	saveRawOutputItem := func(item map[string]any) map[string]any {
+		id := rawOutputID(item)
+		if _, ok := rawOutputByID[id]; !ok {
+			rawOutputOrder = append(rawOutputOrder, id)
+		}
+		cloned := cloneMap(item)
+		rawOutputByID[id] = cloned
+		return cloned
+	}
+	rawFunctionCallItem := func(itemID, callID string) map[string]any {
+		if itemID != "" {
+			if item := rawOutputByID[itemID]; item != nil {
+				return item
+			}
+		}
+		if callID != "" {
+			if item := rawOutputByID[callID]; item != nil {
+				return item
+			}
+		}
+		if mapped := itemIDToCallID[itemID]; mapped != "" {
+			if item := rawOutputByID[mapped]; item != nil {
+				return item
+			}
+		}
+		return nil
+	}
+	rawResponsesOutput := func() []json.RawMessage {
+		out := make([]json.RawMessage, 0, len(rawOutputOrder))
+		for _, id := range rawOutputOrder {
+			item := rawOutputByID[id]
+			if item == nil {
+				continue
+			}
+			b, err := json.Marshal(item)
+			if err != nil {
+				continue
+			}
+			out = append(out, b)
+		}
+		return out
+	}
 
 	processEvent := func(eventName string, dataLines []string) error {
 		if len(dataLines) == 0 {
@@ -390,6 +449,11 @@ func mapResponsesStreamReader(r io.Reader) (*ChatResponse, error) {
 		switch eventType {
 		case "response.completed":
 			if response, ok := ev["response"]; ok {
+				if responseMap, ok := response.(map[string]any); ok {
+					if _, hasStatus := responseMap["status"]; !hasStatus {
+						responseMap["status"] = "completed"
+					}
+				}
 				b, err := json.Marshal(response)
 				if err != nil {
 					return err
@@ -403,7 +467,11 @@ func mapResponsesStreamReader(r io.Reader) (*ChatResponse, error) {
 			}
 		case "response.output_item.added", "response.output_item.done":
 			item, ok := ev["item"].(map[string]any)
-			if !ok || item["type"] != "function_call" {
+			if !ok {
+				return nil
+			}
+			rawItem := saveRawOutputItem(item)
+			if item["type"] != "function_call" {
 				return nil
 			}
 			callID, _ := item["call_id"].(string)
@@ -417,6 +485,7 @@ func mapResponsesStreamReader(r io.Reader) (*ChatResponse, error) {
 			}
 			if args, _ := item["arguments"].(string); args != "" {
 				tc.Function.Arguments = args
+				rawItem["arguments"] = args
 			}
 		case "response.function_call_arguments.delta":
 			callID, _ := ev["call_id"].(string)
@@ -427,13 +496,13 @@ func mapResponsesStreamReader(r io.Reader) (*ChatResponse, error) {
 			}
 			if delta, _ := ev["delta"].(string); delta != "" {
 				tc.Function.Arguments += delta
+				if item := rawFunctionCallItem(itemID, callID); item != nil {
+					args, _ := item["arguments"].(string)
+					item["arguments"] = args + delta
+				}
 			}
 		case "response.failed", "response.incomplete":
-			if errObj, ok := ev["error"]; ok {
-				b, _ := json.Marshal(errObj)
-				return fmt.Errorf("responses stream failed: %s", redactSensitiveString(string(b)))
-			}
-			return fmt.Errorf("responses stream failed: %s", eventType)
+			return formatResponsesStreamError(eventType, ev)
 		}
 		return nil
 	}
@@ -460,6 +529,9 @@ func mapResponsesStreamReader(r io.Reader) (*ChatResponse, error) {
 					resp.Choices[0].Message.ToolCalls = append(resp.Choices[0].Message.ToolCalls, *tc)
 				}
 			}
+			if len(resp.ResponsesOutput) == 0 && len(rawOutputOrder) > 0 {
+				resp.ResponsesOutput = rawResponsesOutput()
+			}
 			return resp, nil
 		}
 
@@ -480,6 +552,7 @@ func mapResponsesStreamReader(r io.Reader) (*ChatResponse, error) {
 			contentPtr = &content
 		}
 		return &ChatResponse{
+			ResponsesOutput: rawResponsesOutput(),
 			Choices: []Choice{{
 				Message: ResponseMessage{
 					Role:      "assistant",
@@ -536,14 +609,19 @@ func mapResponsesStreamReader(r io.Reader) (*ChatResponse, error) {
 	return finish()
 }
 
-func validateResponsesStatus(status string, errObj any, incompleteDetails any) error {
+func validateResponsesStatus(status string, errObj any, incompleteDetails any, hasResponseContent bool) error {
 	status = strings.ToLower(strings.TrimSpace(status))
 	if errObj != nil {
 		return fmt.Errorf("responses API failed: %s", formatRedactedJSONValue(errObj))
 	}
 	switch status {
-	case "", "completed":
+	case "completed":
 		return nil
+	case "":
+		if hasResponseContent {
+			return nil
+		}
+		return fmt.Errorf("responses API missing status")
 	case "failed", "cancelled":
 		return fmt.Errorf("responses API failed with status %q", status)
 	case "incomplete":
@@ -551,6 +629,43 @@ func validateResponsesStatus(status string, errObj any, incompleteDetails any) e
 	default:
 		return fmt.Errorf("responses API unexpected status %q", status)
 	}
+}
+
+func formatResponsesStreamError(eventType string, ev map[string]any) error {
+	label := "failed"
+	if eventType == "response.incomplete" {
+		label = "incomplete"
+	}
+	if reason := nestedString(ev, "response", "incomplete_details", "reason"); reason != "" {
+		return fmt.Errorf("responses stream %s: reason=%s", label, redactSensitiveString(reason))
+	}
+	if reason := nestedString(ev, "incomplete_details", "reason"); reason != "" {
+		return fmt.Errorf("responses stream %s: reason=%s", label, redactSensitiveString(reason))
+	}
+	if msg := nestedString(ev, "response", "error", "message"); msg != "" {
+		return fmt.Errorf("responses stream %s: %s", label, redactSensitiveString(msg))
+	}
+	if msg := nestedString(ev, "error", "message"); msg != "" {
+		return fmt.Errorf("responses stream %s: %s", label, redactSensitiveString(msg))
+	}
+	if errObj, ok := ev["error"]; ok {
+		b, _ := json.Marshal(errObj)
+		return fmt.Errorf("responses stream %s: %s", label, redactSensitiveString(string(b)))
+	}
+	return fmt.Errorf("responses stream %s: %s", label, eventType)
+}
+
+func nestedString(v any, path ...string) string {
+	current := v
+	for _, key := range path {
+		m, ok := current.(map[string]any)
+		if !ok {
+			return ""
+		}
+		current = m[key]
+	}
+	s, _ := current.(string)
+	return s
 }
 
 func formatRedactedJSONValue(v any) string {
@@ -571,6 +686,14 @@ func redactSensitiveString(s string) string {
 	return s
 }
 
+func sanitizeHTTPErrorBody(s string) string {
+	s = redactSensitiveString(s)
+	if len(s) > maxResponsesErrorBodyLen {
+		return s[:maxResponsesErrorBodyLen] + "...<truncated>"
+	}
+	return s
+}
+
 func cloneRawMessages(in []json.RawMessage) []json.RawMessage {
 	if len(in) == 0 {
 		return nil
@@ -578,6 +701,17 @@ func cloneRawMessages(in []json.RawMessage) []json.RawMessage {
 	out := make([]json.RawMessage, len(in))
 	for i := range in {
 		out[i] = append(json.RawMessage(nil), in[i]...)
+	}
+	return out
+}
+
+func cloneMap(in map[string]any) map[string]any {
+	if in == nil {
+		return nil
+	}
+	out := make(map[string]any, len(in))
+	for k, v := range in {
+		out[k] = v
 	}
 	return out
 }

@@ -193,6 +193,10 @@ func TestResponsesClient_RequestAndTextOutput(t *testing.T) {
 	if gotBody["stream"] != true {
 		t.Errorf("stream = %v, want true", gotBody["stream"])
 	}
+	include, ok := gotBody["include"].([]any)
+	if !ok || len(include) != 1 || include[0] != "reasoning.encrypted_content" {
+		t.Fatalf("include = %#v, want reasoning.encrypted_content", gotBody["include"])
+	}
 	if _, ok := gotBody["max_output_tokens"]; ok {
 		t.Errorf("max_output_tokens should be omitted for ChatGPT auth, got %v", gotBody["max_output_tokens"])
 	}
@@ -226,6 +230,36 @@ func TestResponsesClient_APIKeyRequestsNonStreamingByDefault(t *testing.T) {
 	}
 	if gotBody["stream"] != false {
 		t.Errorf("stream = %v, want false", gotBody["stream"])
+	}
+}
+
+func TestResponsesClient_ExtraBodyIncludeOverridesChatGPTDefaultInclude(t *testing.T) {
+	var gotBody map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&gotBody); err != nil {
+			t.Fatalf("decode request body: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp_test","model":"gpt-5.5","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"ok"}]}]}`))
+	}))
+	defer server.Close()
+
+	client := NewResponsesClient(ClientConfig{
+		URL:      server.URL + "/v1",
+		APIKey:   "token",
+		Model:    "gpt-5.5",
+		AuthMode: "chatgpt",
+		ExtraBody: map[string]any{
+			"include": []any{"custom.include"},
+		},
+	})
+	_, err := client.CompletionsWithCtx(context.Background(), ChatRequest{Messages: []Message{{Role: "user", Content: "ping"}}})
+	if err != nil {
+		t.Fatalf("CompletionsWithCtx: %v", err)
+	}
+	include, ok := gotBody["include"].([]any)
+	if !ok || len(include) != 1 || include[0] != "custom.include" {
+		t.Fatalf("include = %#v, want custom include", gotBody["include"])
 	}
 }
 
@@ -311,6 +345,21 @@ func TestResponsesClient_RejectsNonCompletedStatusWithoutOutput(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), `unexpected status "queued"`) {
 		t.Fatalf("error = %v, want queued status", err)
+	}
+}
+
+func TestResponsesClient_RejectsMissingStatusAndEmptyOutput(t *testing.T) {
+	raw := []byte(`{
+		"id":"resp_empty",
+		"model":"gpt-5.5"
+	}`)
+
+	_, err := mapResponsesResponse(raw)
+	if err == nil {
+		t.Fatal("mapResponsesResponse succeeded, want missing status error")
+	}
+	if !strings.Contains(err.Error(), "missing status") {
+		t.Fatalf("error = %v, want missing status", err)
 	}
 }
 
@@ -472,6 +521,74 @@ func TestResponsesClient_PreservesRawOutputItemsForReplay(t *testing.T) {
 	}
 }
 
+func TestResponsesClient_PreservesStreamingFallbackRawOutputForReplay(t *testing.T) {
+	raw := []byte(strings.Join([]string{
+		"event: response.output_item.done",
+		`data: {"type":"response.output_item.done","item":{"type":"reasoning","id":"rs_1","encrypted_content":"sealed"}}`,
+		"",
+		"event: response.output_item.added",
+		`data: {"type":"response.output_item.added","item":{"type":"function_call","id":"item_1","call_id":"call_1","name":"read_file"}}`,
+		"",
+		"event: response.function_call_arguments.delta",
+		`data: {"type":"response.function_call_arguments.delta","item_id":"item_1","delta":"{\"path\""}`,
+		"",
+		"event: response.function_call_arguments.delta",
+		`data: {"type":"response.function_call_arguments.delta","item_id":"item_1","delta":":\"README.md\"}"}`,
+		"",
+		"event: response.completed",
+		`data: {"type":"response.completed","response":{"id":"resp_stream","model":"gpt-5.5","status":"completed","output":[]}}`,
+		"",
+	}, "\n"))
+
+	resp, err := mapResponsesStream(raw)
+	if err != nil {
+		t.Fatalf("mapResponsesStream: %v", err)
+	}
+	if len(resp.ResponsesOutput) != 2 {
+		t.Fatalf("ResponsesOutput len = %d, want reasoning + function_call", len(resp.ResponsesOutput))
+	}
+
+	msgs := []Message{
+		NewTextMessage("user", "review"),
+		NewResponsesOutputMessage("", resp.ToolCalls(), resp.ResponsesOutput),
+		NewToolResultMessage("call_1", "file contents"),
+	}
+	client := NewResponsesClient(ClientConfig{URL: "https://api.example.com/v1"})
+	body, err := client.buildResponsesBody("gpt-5.5", ChatRequest{Messages: msgs})
+	if err != nil {
+		t.Fatalf("buildResponsesBody: %v", err)
+	}
+	input := body["input"].([]map[string]any)
+	if len(input) != 4 {
+		t.Fatalf("input len = %d, want user + reasoning + function_call + tool output: %#v", len(input), input)
+	}
+	if input[1]["type"] != "reasoning" || input[1]["encrypted_content"] != "sealed" {
+		t.Fatalf("reasoning item not replayed: %#v", input[1])
+	}
+	if input[2]["type"] != "function_call" || input[2]["call_id"] != "call_1" || input[2]["arguments"] != `{"path":"README.md"}` {
+		t.Fatalf("function_call item not replayed: %#v", input[2])
+	}
+	if input[3]["type"] != "function_call_output" || input[3]["call_id"] != "call_1" {
+		t.Fatalf("tool output not replayed: %#v", input[3])
+	}
+}
+
+func TestResponsesClient_StreamIncompleteReportsReason(t *testing.T) {
+	raw := []byte(strings.Join([]string{
+		"event: response.incomplete",
+		`data: {"type":"response.incomplete","response":{"incomplete_details":{"reason":"max_output_tokens"}}}`,
+		"",
+	}, "\n"))
+
+	_, err := mapResponsesStream(raw)
+	if err == nil {
+		t.Fatal("mapResponsesStream succeeded, want incomplete error")
+	}
+	if !strings.Contains(err.Error(), "responses stream incomplete") || !strings.Contains(err.Error(), "max_output_tokens") {
+		t.Fatalf("error = %v, want incomplete reason", err)
+	}
+}
+
 func TestResponsesClient_RedactsSensitiveHTTPErrorBody(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusBadRequest)
@@ -498,6 +615,38 @@ func TestResponsesClient_RedactsSensitiveHTTPErrorBody(t *testing.T) {
 	}
 	if !strings.Contains(errText, "[REDACTED]") {
 		t.Fatalf("error = %s, want redacted marker", errText)
+	}
+}
+
+func TestResponsesClient_TruncatesSensitiveHTTPErrorBody(t *testing.T) {
+	longBody := `{"error":{"message":"bad Bearer chatgpt-token","access_token":"secret","api_key":"sk-test","details":"` + strings.Repeat("x", 9000) + `"}}`
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(longBody))
+	}))
+	defer server.Close()
+
+	client := NewResponsesClient(ClientConfig{
+		URL:      server.URL + "/v1",
+		APIKey:   "chatgpt-token",
+		Model:    "gpt-5.5",
+		AuthMode: "chatgpt",
+	})
+	_, err := client.CompletionsWithCtx(context.Background(), ChatRequest{Messages: []Message{{Role: "user", Content: "ping"}}})
+	if err == nil {
+		t.Fatal("CompletionsWithCtx succeeded, want HTTP error")
+	}
+	errText := err.Error()
+	for _, secret := range []string{"chatgpt-token", "secret", "sk-test"} {
+		if strings.Contains(errText, secret) {
+			t.Fatalf("error leaked %q: %s", secret, errText)
+		}
+	}
+	if !strings.Contains(errText, "<truncated>") {
+		t.Fatalf("error = %s, want truncated marker", errText)
+	}
+	if len(errText) > 8500 {
+		t.Fatalf("error len = %d, want capped body", len(errText))
 	}
 }
 
