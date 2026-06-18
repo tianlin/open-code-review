@@ -459,6 +459,9 @@ func TestResponsesClient_MapsStreamFunctionCallItemIDAliasInOrder(t *testing.T) 
 		"event: response.function_call_arguments.delta",
 		`data: {"type":"response.function_call_arguments.delta","item_id":"item_2","delta":":\"getvCheck\"}"}`,
 		"",
+		"event: response.completed",
+		`data: {"type":"response.completed","response":{"id":"resp_stream","model":"gpt-5.5","status":"completed","output":[]}}`,
+		"",
 	}, "\n"))
 
 	resp, err := mapResponsesStream(raw)
@@ -474,6 +477,63 @@ func TestResponsesClient_MapsStreamFunctionCallItemIDAliasInOrder(t *testing.T) 
 	}
 	if calls[1].ID != "call_2" || calls[1].Function.Name != "code_search" || calls[1].Function.Arguments != `{"search_text":"getvCheck"}` {
 		t.Fatalf("second call = %#v", calls[1])
+	}
+}
+
+func TestResponsesClient_StreamErrorEventReturnsRedactedError(t *testing.T) {
+	raw := []byte(strings.Join([]string{
+		"event: error",
+		`data: {"error":{"message":"Authorization: Bearer secret access_token=abc api_key=sk-test","code":"invalid_api_key"}}`,
+		"",
+	}, "\n"))
+
+	_, err := mapResponsesStream(raw)
+	if err == nil {
+		t.Fatal("mapResponsesStream succeeded, want stream error")
+	}
+	errText := err.Error()
+	if !strings.Contains(errText, "responses stream error") || !strings.Contains(errText, "invalid_api_key") {
+		t.Fatalf("error = %v, want stream error with code", err)
+	}
+	for _, secret := range []string{"Bearer secret", "access_token=abc", "sk-test"} {
+		if strings.Contains(errText, secret) {
+			t.Fatalf("error leaked %q: %s", secret, errText)
+		}
+	}
+}
+
+func TestResponsesClient_StreamEOFBeforeTerminalEventReturnsError(t *testing.T) {
+	raw := []byte(strings.Join([]string{
+		"event: response.output_text.delta",
+		`data: {"type":"response.output_text.delta","delta":"partial review text"}`,
+		"",
+	}, "\n"))
+
+	_, err := mapResponsesStream(raw)
+	if err == nil {
+		t.Fatal("mapResponsesStream succeeded, want non-terminal EOF error")
+	}
+	if !strings.Contains(err.Error(), "ended before terminal event") {
+		t.Fatalf("error = %v, want terminal event error", err)
+	}
+}
+
+func TestResponsesClient_StreamEOFBeforeTerminalFunctionCallReturnsError(t *testing.T) {
+	raw := []byte(strings.Join([]string{
+		"event: response.output_item.added",
+		`data: {"type":"response.output_item.added","item":{"type":"function_call","id":"fc_1","call_id":"call_1","name":"read_file","arguments":""}}`,
+		"",
+		"event: response.function_call_arguments.delta",
+		`data: {"type":"response.function_call_arguments.delta","item_id":"fc_1","delta":"{\"path\": \"internal"}`,
+		"",
+	}, "\n"))
+
+	_, err := mapResponsesStream(raw)
+	if err == nil {
+		t.Fatal("mapResponsesStream succeeded, want non-terminal function call error")
+	}
+	if !strings.Contains(err.Error(), "ended before terminal event") {
+		t.Fatalf("error = %v, want terminal event error", err)
 	}
 }
 

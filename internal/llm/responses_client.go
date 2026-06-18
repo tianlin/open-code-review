@@ -309,6 +309,8 @@ func mapResponsesStreamReader(r io.Reader) (*ChatResponse, error) {
 	var toolCallOrder []string
 	rawOutputByID := make(map[string]map[string]any)
 	var rawOutputOrder []string
+	sawEvent := false
+	sawTerminal := false
 
 	addToolCallID := func(id string) {
 		if id == "" {
@@ -428,13 +430,21 @@ func mapResponsesStreamReader(r io.Reader) (*ChatResponse, error) {
 		}
 		return out
 	}
+	hasCollectedOutput := func() bool {
+		return len(finalRaw) > 0 || len(textParts) > 0 || len(toolCallsByID) > 0 || len(rawOutputByID) > 0
+	}
 
 	processEvent := func(eventName string, dataLines []string) error {
 		if len(dataLines) == 0 {
 			return nil
 		}
+		sawEvent = true
 		data := strings.Join(dataLines, "\n")
 		if strings.TrimSpace(data) == "[DONE]" {
+			sawTerminal = true
+			if !hasCollectedOutput() {
+				return fmt.Errorf("responses stream ended with [DONE] but no output")
+			}
 			return streamDone
 		}
 		var ev map[string]any
@@ -448,6 +458,7 @@ func mapResponsesStreamReader(r io.Reader) (*ChatResponse, error) {
 
 		switch eventType {
 		case "response.completed":
+			sawTerminal = true
 			if response, ok := ev["response"]; ok {
 				if responseMap, ok := response.(map[string]any); ok {
 					if _, hasStatus := responseMap["status"]; !hasStatus {
@@ -461,6 +472,9 @@ func mapResponsesStreamReader(r io.Reader) (*ChatResponse, error) {
 				finalRaw = b
 			}
 			return streamDone
+		case "error":
+			sawTerminal = true
+			return formatResponsesStreamError(eventType, ev)
 		case "response.output_text.delta":
 			if delta, ok := ev["delta"].(string); ok {
 				textParts = append(textParts, delta)
@@ -502,6 +516,7 @@ func mapResponsesStreamReader(r io.Reader) (*ChatResponse, error) {
 				}
 			}
 		case "response.failed", "response.incomplete":
+			sawTerminal = true
 			return formatResponsesStreamError(eventType, ev)
 		}
 		return nil
@@ -605,6 +620,12 @@ func mapResponsesStreamReader(r io.Reader) (*ChatResponse, error) {
 		}
 		return nil, err
 	}
+	if !sawEvent {
+		return nil, fmt.Errorf("responses stream ended without events")
+	}
+	if !sawTerminal {
+		return nil, fmt.Errorf("responses stream ended before terminal event")
+	}
 
 	return finish()
 }
@@ -635,24 +656,38 @@ func formatResponsesStreamError(eventType string, ev map[string]any) error {
 	label := "failed"
 	if eventType == "response.incomplete" {
 		label = "incomplete"
+	} else if eventType == "error" {
+		label = "error"
 	}
 	if reason := nestedString(ev, "response", "incomplete_details", "reason"); reason != "" {
-		return fmt.Errorf("responses stream %s: reason=%s", label, redactSensitiveString(reason))
+		return fmt.Errorf("responses stream %s: reason=%s", label, sanitizeHTTPErrorBody(reason))
 	}
 	if reason := nestedString(ev, "incomplete_details", "reason"); reason != "" {
-		return fmt.Errorf("responses stream %s: reason=%s", label, redactSensitiveString(reason))
+		return fmt.Errorf("responses stream %s: reason=%s", label, sanitizeHTTPErrorBody(reason))
 	}
 	if msg := nestedString(ev, "response", "error", "message"); msg != "" {
-		return fmt.Errorf("responses stream %s: %s", label, redactSensitiveString(msg))
+		return fmt.Errorf("responses stream %s: %s", label, formatResponsesStreamMessage(nestedString(ev, "response", "error", "code"), msg))
 	}
 	if msg := nestedString(ev, "error", "message"); msg != "" {
-		return fmt.Errorf("responses stream %s: %s", label, redactSensitiveString(msg))
+		return fmt.Errorf("responses stream %s: %s", label, formatResponsesStreamMessage(nestedString(ev, "error", "code"), msg))
+	}
+	if msg := nestedString(ev, "message"); msg != "" {
+		return fmt.Errorf("responses stream %s: %s", label, formatResponsesStreamMessage(nestedString(ev, "code"), msg))
 	}
 	if errObj, ok := ev["error"]; ok {
 		b, _ := json.Marshal(errObj)
-		return fmt.Errorf("responses stream %s: %s", label, redactSensitiveString(string(b)))
+		return fmt.Errorf("responses stream %s: %s", label, sanitizeHTTPErrorBody(string(b)))
 	}
-	return fmt.Errorf("responses stream %s: %s", label, eventType)
+	b, _ := json.Marshal(ev)
+	return fmt.Errorf("responses stream %s: %s", label, sanitizeHTTPErrorBody(string(b)))
+}
+
+func formatResponsesStreamMessage(code, msg string) string {
+	msg = sanitizeHTTPErrorBody(msg)
+	if code == "" {
+		return msg
+	}
+	return sanitizeHTTPErrorBody(code) + ": " + msg
 }
 
 func nestedString(v any, path ...string) string {
