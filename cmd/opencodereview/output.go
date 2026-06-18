@@ -45,9 +45,6 @@ func outputTextWithWarnings(comments []model.LlmComment, warnings []agent.AgentW
 		}
 	}
 	for _, w := range warnings {
-		if w.Type == "subtask_error" {
-			continue
-		}
 		fmt.Fprintf(os.Stderr, "[ocr] WARNING [%s] %s: %s\n", w.Type, sanitizeTerminal(w.File), sanitizeTerminal(w.Message))
 	}
 }

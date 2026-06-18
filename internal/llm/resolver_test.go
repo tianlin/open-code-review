@@ -321,6 +321,83 @@ func TestResolveEndpoint_ProviderOpenAI(t *testing.T) {
 	}
 }
 
+func TestResolveEndpoint_ProviderCodexChatGPTAuth(t *testing.T) {
+	clearAllEnv(t)
+	codexHome := t.TempDir()
+	t.Setenv("CODEX_HOME", codexHome)
+	authPath := filepath.Join(codexHome, "auth.json")
+	authData := []byte(`{
+		"auth_mode": "chatgpt",
+		"tokens": {
+			"access_token": "chatgpt-access-token",
+			"account_id": "account-123"
+		}
+	}`)
+	if err := os.WriteFile(authPath, authData, 0600); err != nil {
+		t.Fatalf("write auth.json: %v", err)
+	}
+
+	cfg := configFile{
+		Provider: "codex",
+		Providers: map[string]providerEntryConfig{
+			"codex": {Model: "gpt-5.5"},
+		},
+	}
+	data, _ := json.Marshal(cfg)
+	cfgPath := filepath.Join(t.TempDir(), "config.json")
+	os.WriteFile(cfgPath, data, 0644)
+
+	ep, err := ResolveEndpoint(cfgPath)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if ep.Protocol != "responses" {
+		t.Errorf("Protocol = %q, want %q", ep.Protocol, "responses")
+	}
+	if ep.AuthMode != "chatgpt" {
+		t.Errorf("AuthMode = %q, want %q", ep.AuthMode, "chatgpt")
+	}
+	if ep.Token != "chatgpt-access-token" {
+		t.Errorf("Token = %q, want %q", ep.Token, "chatgpt-access-token")
+	}
+	if ep.AccountID != "account-123" {
+		t.Errorf("AccountID = %q, want %q", ep.AccountID, "account-123")
+	}
+	if ep.URL != "https://chatgpt.com/backend-api/codex/responses" {
+		t.Errorf("URL = %q, want ChatGPT Codex responses endpoint", ep.URL)
+	}
+}
+
+func TestResolveEndpoint_CustomProviderResponsesProtocol(t *testing.T) {
+	clearAllEnv(t)
+
+	cfg := configFile{
+		Provider: "responses-gateway",
+		CustomProviders: map[string]providerEntryConfig{
+			"responses-gateway": {
+				APIKey:   "token",
+				URL:      "https://gateway.internal.com/v1",
+				Protocol: "responses",
+				Model:    "gpt-5.5",
+			},
+		},
+	}
+	data, _ := json.Marshal(cfg)
+	cfgPath := filepath.Join(t.TempDir(), "config.json")
+	os.WriteFile(cfgPath, data, 0644)
+
+	ep, err := ResolveEndpoint(cfgPath)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if ep.Protocol != "responses" {
+		t.Errorf("Protocol = %q, want %q", ep.Protocol, "responses")
+	}
+	if ep.URL != "https://gateway.internal.com/v1/responses" {
+		t.Errorf("URL = %q, want responses suffix", ep.URL)
+	}
+}
+
 func TestResolveEndpoint_ProviderModelOverride(t *testing.T) {
 	clearAllEnv(t)
 

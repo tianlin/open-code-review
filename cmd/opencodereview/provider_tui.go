@@ -50,7 +50,7 @@ const (
 	manualStepAuthToken
 )
 
-var cpProtocols = []string{"anthropic", "openai"}
+var cpProtocols = []string{"anthropic", "openai", "responses"}
 
 type customProviderListItem struct {
 	name  string

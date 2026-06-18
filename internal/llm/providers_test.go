@@ -6,7 +6,7 @@ import (
 )
 
 func TestLookupProvider_KnownProviders(t *testing.T) {
-	names := []string{"anthropic", "openai", "dashscope"}
+	names := []string{"anthropic", "openai", "openai-responses", "codex", "dashscope"}
 	for _, name := range names {
 		p, ok := LookupProvider(name)
 		if !ok {
@@ -40,7 +40,7 @@ func TestListProviders_Order(t *testing.T) {
 	if len(providers) < 3 {
 		t.Fatalf("expected at least 3 providers, got %d", len(providers))
 	}
-	expected := []string{"anthropic", "dashscope", "deepseek", "hy-tokenplan", "kimi", "mimo", "minimax", "openai", "tencent-tokenhub", "volcengine", "z-ai"}
+	expected := []string{"anthropic", "codex", "dashscope", "deepseek", "hy-tokenplan", "kimi", "mimo", "minimax", "openai", "openai-responses", "tencent-tokenhub", "volcengine", "z-ai"}
 	if len(providers) != len(expected) {
 		t.Fatalf("expected %d providers, got %d", len(expected), len(providers))
 	}

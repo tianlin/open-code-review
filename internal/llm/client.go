@@ -1,5 +1,5 @@
 // Package llm provides LLM client interfaces supporting multiple protocols.
-// Supported protocols: Anthropic Messages API, OpenAI Chat Completions API.
+// Supported protocols: Anthropic Messages API, OpenAI Chat Completions API, OpenAI Responses API.
 package llm
 
 import (
@@ -183,6 +183,8 @@ type ClientConfig struct {
 	APIKey     string         // Bearer token / API key
 	Model      string         // Default model override
 	AuthHeader string         // Auth header name: "x-api-key", "authorization", or empty for protocol default
+	AuthMode   string         // "api_key" or "chatgpt"
+	AccountID  string         // ChatGPT account id for ChatGPT auth mode
 	Timeout    time.Duration  // Request timeout
 	ExtraBody  map[string]any // Vendor-specific fields merged into every request body
 }
@@ -190,19 +192,24 @@ type ClientConfig struct {
 // --- Factory ---
 
 // NewLLMClient creates the appropriate client based on the resolved endpoint protocol.
-// protocol: "anthropic" -> AnthropicClient, anything else -> OpenAIClient.
 func NewLLMClient(ep ResolvedEndpoint) LLMClient {
 	cfg := ClientConfig{
 		URL:        ep.URL,
 		APIKey:     ep.Token,
 		Model:      ep.Model,
 		AuthHeader: ep.AuthHeader,
+		AuthMode:   ep.AuthMode,
+		AccountID:  ep.AccountID,
 		ExtraBody:  ep.ExtraBody,
 	}
-	if ep.Protocol == "anthropic" {
+	switch ep.Protocol {
+	case "anthropic":
 		return NewAnthropicClient(cfg)
+	case "responses":
+		return NewResponsesClient(cfg)
+	default:
+		return NewOpenAIClient(cfg)
 	}
-	return NewOpenAIClient(cfg)
 }
 
 // --- Token counting with tiktoken ---

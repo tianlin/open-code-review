@@ -88,6 +88,8 @@ type ProviderEntry struct {
 	Model      string         `json:"model,omitempty"`
 	Models     []string       `json:"models,omitempty"`
 	AuthHeader string         `json:"auth_header,omitempty"`
+	AuthMode   string         `json:"auth_mode,omitempty"`
+	AuthFile   string         `json:"auth_file,omitempty"`
 	ExtraBody  map[string]any `json:"extra_body,omitempty"`
 }
 
@@ -107,6 +109,7 @@ type LlmConfig struct {
 	AuthToken    string         `json:"auth_token,omitempty"`
 	AuthHeader   string         `json:"auth_header,omitempty"`
 	Model        string         `json:"model,omitempty"`
+	Protocol     string         `json:"protocol,omitempty"`
 	UseAnthropic *bool          `json:"use_anthropic,omitempty"` // nil = default true; false = OpenAI protocol
 	ExtraBody    map[string]any `json:"extra_body,omitempty"`
 }
@@ -212,6 +215,11 @@ func setConfigValue(cfg *Config, key, value string) error {
 		cfg.Llm.AuthHeader = normalized
 	case "llm.model", "llm.Model":
 		cfg.Llm.Model = value
+	case "llm.protocol", "llm.Protocol":
+		if value != "anthropic" && value != "openai" && value != "responses" {
+			return fmt.Errorf("invalid protocol %q: must be \"anthropic\", \"openai\", or \"responses\"", value)
+		}
+		cfg.Llm.Protocol = value
 	case "llm.use_anthropic", "llm.UseAnthropic":
 		b, err := strconv.ParseBool(value)
 		if err != nil {
@@ -247,7 +255,7 @@ func setConfigValue(cfg *Config, key, value string) error {
 		}
 		cfg.Llm.ExtraBody = m
 	default:
-		return fmt.Errorf("unknown config key: %s\nSupported keys: provider, model, providers.<name>.<field>, custom_providers.<name>.<field>, llm.url, llm.auth_token, llm.auth_header, llm.model, llm.use_anthropic, llm.extra_body, language, telemetry.enabled, telemetry.exporter, telemetry.otlp_endpoint, telemetry.content_logging\nProvider fields: api_key, url, protocol, model, models, auth_header, extra_body", key)
+		return fmt.Errorf("unknown config key: %s\nSupported keys: provider, model, providers.<name>.<field>, custom_providers.<name>.<field>, llm.url, llm.auth_token, llm.auth_header, llm.model, llm.protocol, llm.use_anthropic, llm.extra_body, language, telemetry.enabled, telemetry.exporter, telemetry.otlp_endpoint, telemetry.content_logging\nProvider fields: api_key, url, protocol, model, models, auth_header, auth_mode, auth_file, extra_body", key)
 	}
 	return nil
 }
@@ -259,8 +267,8 @@ func applyProviderField(entry *ProviderEntry, field, key, value string) error {
 	case "url":
 		entry.URL = value
 	case "protocol":
-		if value != "anthropic" && value != "openai" {
-			return fmt.Errorf("invalid protocol %q: must be \"anthropic\" or \"openai\"", value)
+		if value != "anthropic" && value != "openai" && value != "responses" {
+			return fmt.Errorf("invalid protocol %q: must be \"anthropic\", \"openai\", or \"responses\"", value)
 		}
 		entry.Protocol = value
 	case "model":
@@ -277,6 +285,13 @@ func applyProviderField(entry *ProviderEntry, field, key, value string) error {
 			return err
 		}
 		entry.AuthHeader = normalized
+	case "auth_mode":
+		if value != "api_key" && value != "chatgpt" {
+			return fmt.Errorf("invalid auth_mode %q: must be \"api_key\" or \"chatgpt\"", value)
+		}
+		entry.AuthMode = value
+	case "auth_file":
+		entry.AuthFile = value
 	case "extra_body":
 		var m map[string]any
 		if err := json.Unmarshal([]byte(value), &m); err != nil {
@@ -284,7 +299,7 @@ func applyProviderField(entry *ProviderEntry, field, key, value string) error {
 		}
 		entry.ExtraBody = m
 	default:
-		return fmt.Errorf("unknown provider field %q: supported fields are api_key, url, protocol, model, models, auth_header, extra_body", field)
+		return fmt.Errorf("unknown provider field %q: supported fields are api_key, url, protocol, model, models, auth_header, auth_mode, auth_file, extra_body", field)
 	}
 	return nil
 }

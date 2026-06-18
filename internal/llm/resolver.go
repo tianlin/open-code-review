@@ -14,8 +14,10 @@ type ResolvedEndpoint struct {
 	URL        string
 	Token      string
 	Model      string
-	Protocol   string         // "anthropic" or "openai"
+	Protocol   string         // "anthropic", "openai", or "responses"
 	AuthHeader string         // Anthropic auth header: "x-api-key" or "authorization"
+	AuthMode   string         // "api_key" or "chatgpt"
+	AccountID  string         // ChatGPT account id for ChatGPT auth
 	Source     string         // human-readable config source label
 	ExtraBody  map[string]any // vendor-specific request body fields
 }
@@ -120,6 +122,7 @@ type llmFileConfig struct {
 	AuthToken    string         `json:"auth_token,omitempty"`
 	AuthHeader   string         `json:"auth_header,omitempty"`
 	Model        string         `json:"model,omitempty"`
+	Protocol     string         `json:"protocol,omitempty"`
 	UseAnthropic *bool          `json:"use_anthropic,omitempty"` // pointer to distinguish unset from false
 	ExtraBody    map[string]any `json:"extra_body,omitempty"`
 }
@@ -132,6 +135,8 @@ type providerEntryConfig struct {
 	Model      string         `json:"model,omitempty"`
 	Models     []string       `json:"models,omitempty"`
 	AuthHeader string         `json:"auth_header,omitempty"`
+	AuthMode   string         `json:"auth_mode,omitempty"`
+	AuthFile   string         `json:"auth_file,omitempty"`
 	ExtraBody  map[string]any `json:"extra_body,omitempty"`
 }
 
@@ -184,23 +189,14 @@ func tryProviderConfig(cfg configFile, modelOverride string) (ResolvedEndpoint, 
 		return ResolvedEndpoint{}, false, fmt.Errorf("provider %q is set but not configured in %s section", cfg.Provider, section)
 	}
 
-	apiKey := entry.APIKey
-	if apiKey == "" {
-		if isPreset && preset.EnvVar != "" {
-			apiKey = os.Getenv(preset.EnvVar)
-		}
-	}
-	if apiKey == "" {
-		return ResolvedEndpoint{}, false, fmt.Errorf("provider %q has no api_key configured and no environment variable fallback found", cfg.Provider)
-	}
-
-	var url, protocol, authHeader, model string
+	var url, protocol, authHeader, model, authMode string
 	var extraBody map[string]any
 
 	if isPreset {
 		url = preset.BaseURL
 		protocol = preset.Protocol
 		authHeader = preset.AuthHeader
+		authMode = preset.AuthMode
 		if entry.URL != "" {
 			url = entry.URL
 		}
@@ -212,11 +208,36 @@ func tryProviderConfig(cfg configFile, modelOverride string) (ResolvedEndpoint, 
 		if entry.URL == "" || entry.Protocol == "" {
 			return ResolvedEndpoint{}, false, fmt.Errorf("custom provider %q requires url and protocol fields", cfg.Provider)
 		}
-		if !strings.EqualFold(entry.Protocol, "anthropic") && !strings.EqualFold(entry.Protocol, "openai") {
-			return ResolvedEndpoint{}, false, fmt.Errorf("custom provider %q has invalid protocol %q: must be \"anthropic\" or \"openai\"", cfg.Provider, entry.Protocol)
+		if !validProtocol(entry.Protocol) {
+			return ResolvedEndpoint{}, false, fmt.Errorf("custom provider %q has invalid protocol %q: must be \"anthropic\", \"openai\", or \"responses\"", cfg.Provider, entry.Protocol)
 		}
 		url = entry.URL
 		protocol = strings.ToLower(entry.Protocol)
+	}
+	if authMode == "" {
+		authMode = "api_key"
+	}
+	if entry.AuthMode != "" {
+		authMode = strings.ToLower(strings.TrimSpace(entry.AuthMode))
+	}
+	if !validAuthMode(authMode) {
+		return ResolvedEndpoint{}, false, fmt.Errorf("provider %q has invalid auth_mode %q: must be \"api_key\" or \"chatgpt\"", cfg.Provider, authMode)
+	}
+
+	apiKey := entry.APIKey
+	var accountID string
+	if authMode == "chatgpt" {
+		token, acct, err := loadChatGPTAuth(entry.AuthFile)
+		if err != nil {
+			return ResolvedEndpoint{}, false, fmt.Errorf("provider %q: %w", cfg.Provider, err)
+		}
+		apiKey = token
+		accountID = acct
+	} else if apiKey == "" && isPreset && preset.EnvVar != "" {
+		apiKey = os.Getenv(preset.EnvVar)
+	}
+	if apiKey == "" {
+		return ResolvedEndpoint{}, false, fmt.Errorf("provider %q has no api_key configured and no environment variable fallback found", cfg.Provider)
 	}
 
 	if cfg.Model != "" {
@@ -276,6 +297,8 @@ func tryProviderConfig(cfg configFile, modelOverride string) (ResolvedEndpoint, 
 
 	if protocol == "anthropic" {
 		url = ensureMessagesSuffix(url)
+	} else if protocol == "responses" {
+		url = ensureResponsesSuffix(url)
 	}
 
 	return ResolvedEndpoint{
@@ -284,6 +307,8 @@ func tryProviderConfig(cfg configFile, modelOverride string) (ResolvedEndpoint, 
 		Model:      model,
 		Protocol:   protocol,
 		AuthHeader: authHeader,
+		AuthMode:   authMode,
+		AccountID:  accountID,
 		Source:     "provider:" + cfg.Provider,
 		ExtraBody:  extraBody,
 	}, true, nil
@@ -305,7 +330,12 @@ func tryLegacyLlmConfig(cfg configFile, modelOverride string) (ResolvedEndpoint,
 	}
 
 	protocol := "anthropic"
-	if !useAnthropic {
+	if cfg.Llm.Protocol != "" {
+		if !validProtocol(cfg.Llm.Protocol) {
+			return ResolvedEndpoint{}, false, fmt.Errorf("OCR config file has invalid llm.protocol %q: must be \"anthropic\", \"openai\", or \"responses\"", cfg.Llm.Protocol)
+		}
+		protocol = strings.ToLower(cfg.Llm.Protocol)
+	} else if !useAnthropic {
 		protocol = "openai"
 	}
 
@@ -321,7 +351,11 @@ func tryLegacyLlmConfig(cfg configFile, modelOverride string) (ResolvedEndpoint,
 		}
 	}
 
-	return ResolvedEndpoint{URL: cfg.Llm.URL, Token: cfg.Llm.AuthToken, Model: model, Protocol: protocol, AuthHeader: authHeader, Source: "OCR config file", ExtraBody: cfg.Llm.ExtraBody}, true, nil
+	url := cfg.Llm.URL
+	if protocol == "responses" {
+		url = ensureResponsesSuffix(url)
+	}
+	return ResolvedEndpoint{URL: url, Token: cfg.Llm.AuthToken, Model: model, Protocol: protocol, AuthHeader: authHeader, AuthMode: "api_key", Source: "OCR config file", ExtraBody: cfg.Llm.ExtraBody}, true, nil
 }
 
 // tryCCEnv reads Claude Code environment variables.
@@ -436,6 +470,88 @@ func defaultAuthHeader(protocol string) string {
 	return ""
 }
 
+func validProtocol(protocol string) bool {
+	switch strings.ToLower(strings.TrimSpace(protocol)) {
+	case "anthropic", "openai", "responses":
+		return true
+	default:
+		return false
+	}
+}
+
+func validAuthMode(authMode string) bool {
+	switch strings.ToLower(strings.TrimSpace(authMode)) {
+	case "", "api_key", "chatgpt":
+		return true
+	default:
+		return false
+	}
+}
+
+type chatGPTAuthFile struct {
+	AuthMode string `json:"auth_mode"`
+	Tokens   struct {
+		AccessToken string `json:"access_token"`
+		AccountID   string `json:"account_id"`
+	} `json:"tokens"`
+}
+
+func loadChatGPTAuth(authFile string) (string, string, error) {
+	path, err := resolveChatGPTAuthPath(authFile)
+	if err != nil {
+		return "", "", err
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", "", fmt.Errorf("read ChatGPT auth file %s: %w", path, err)
+	}
+
+	var auth chatGPTAuthFile
+	if err := json.Unmarshal(data, &auth); err != nil {
+		return "", "", fmt.Errorf("parse ChatGPT auth file %s: %w", path, err)
+	}
+	if auth.AuthMode != "" && auth.AuthMode != "chatgpt" {
+		return "", "", fmt.Errorf("ChatGPT auth file %s has auth_mode %q, want \"chatgpt\"", path, auth.AuthMode)
+	}
+	if auth.Tokens.AccessToken == "" {
+		return "", "", fmt.Errorf("ChatGPT auth file %s has no tokens.access_token", path)
+	}
+	return auth.Tokens.AccessToken, auth.Tokens.AccountID, nil
+}
+
+func resolveChatGPTAuthPath(authFile string) (string, error) {
+	if authFile != "" {
+		return expandHome(strings.TrimSpace(authFile))
+	}
+	codexHome := strings.TrimSpace(os.Getenv("CODEX_HOME"))
+	if codexHome == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", err
+		}
+		codexHome = filepath.Join(home, ".codex")
+	}
+	return filepath.Join(codexHome, "auth.json"), nil
+}
+
+func expandHome(path string) (string, error) {
+	if path == "~" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", err
+		}
+		return home, nil
+	}
+	if strings.HasPrefix(path, "~/") {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", err
+		}
+		return filepath.Join(home, strings.TrimPrefix(path, "~/")), nil
+	}
+	return path, nil
+}
+
 // modelListContains checks if a model exists in the available models list.
 func modelListContains(models []string, target string) bool {
 	target = strings.TrimSpace(target)
@@ -472,4 +588,14 @@ func ensureMessagesSuffix(rawURL string) string {
 		return rawURL
 	}
 	return u + "/v1/messages"
+}
+
+// ensureResponsesSuffix appends /responses to base URLs that do not already
+// point at a Responses endpoint.
+func ensureResponsesSuffix(rawURL string) string {
+	u := strings.TrimRight(rawURL, "/")
+	if strings.HasSuffix(u, "/responses") {
+		return u
+	}
+	return u + "/responses"
 }

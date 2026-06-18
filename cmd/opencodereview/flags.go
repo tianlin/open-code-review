@@ -287,15 +287,20 @@ Examples:
   ocr config set custom_providers.my-gateway.models '["llama-3-70b","llama-3-8b"]'
   ocr config set custom_providers.my-gateway.api_key "$MY_API_KEY"
 
+  # Codex ChatGPT auth + Responses API
+  ocr config set provider codex
+  ocr config set model gpt-5.5
+
   # Legacy endpoint configuration
   ocr config set llm.url https://xx/v1/openai/chat/completions
   ocr config set llm.auth_token xxxxxxxxxx
   ocr config set llm.auth_header x-api-key
   ocr config set llm.model claude-opus-4-6
+  ocr config set llm.protocol responses
   ocr config set llm.extra_body '{"thinking":{"type":"disabled"}}'
   ocr config set language English
   ocr config set telemetry.enabled true
 
-Supported keys: provider, model, providers.<name>.<field>, custom_providers.<name>.<field>, llm.url, llm.auth_token, llm.auth_header, llm.model, llm.use_anthropic, llm.extra_body, language, telemetry.enabled, telemetry.exporter, telemetry.otlp_endpoint, telemetry.content_logging
-Provider fields: api_key, url, protocol, model, models, auth_header, extra_body`)
+Supported keys: provider, model, providers.<name>.<field>, custom_providers.<name>.<field>, llm.url, llm.auth_token, llm.auth_header, llm.model, llm.protocol, llm.use_anthropic, llm.extra_body, language, telemetry.enabled, telemetry.exporter, telemetry.otlp_endpoint, telemetry.content_logging
+Provider fields: api_key, url, protocol, model, models, auth_header, auth_mode, auth_file, extra_body`)
 }

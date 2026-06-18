@@ -165,8 +165,37 @@ func TestSetConfigValueProviderEntryProtocol(t *testing.T) {
 		t.Errorf("protocol = %q, want %q", cfg.CustomProviders["custom"].Protocol, "openai")
 	}
 
+	if err := setConfigValue(cfg, "custom_providers.custom.protocol", "responses"); err != nil {
+		t.Fatalf("set responses protocol: %v", err)
+	}
+	if cfg.CustomProviders["custom"].Protocol != "responses" {
+		t.Errorf("protocol = %q, want %q", cfg.CustomProviders["custom"].Protocol, "responses")
+	}
+
 	if err := setConfigValue(cfg, "custom_providers.custom.protocol", "invalid"); err == nil {
 		t.Fatal("expected error for invalid protocol")
+	}
+}
+
+func TestSetConfigValueProviderEntryAuthMode(t *testing.T) {
+	cfg := &Config{}
+
+	if err := setConfigValue(cfg, "providers.codex.auth_mode", "chatgpt"); err != nil {
+		t.Fatalf("set auth_mode: %v", err)
+	}
+	if cfg.Providers["codex"].AuthMode != "chatgpt" {
+		t.Errorf("auth_mode = %q, want %q", cfg.Providers["codex"].AuthMode, "chatgpt")
+	}
+
+	if err := setConfigValue(cfg, "providers.codex.auth_file", "/tmp/auth.json"); err != nil {
+		t.Fatalf("set auth_file: %v", err)
+	}
+	if cfg.Providers["codex"].AuthFile != "/tmp/auth.json" {
+		t.Errorf("auth_file = %q, want /tmp/auth.json", cfg.Providers["codex"].AuthFile)
+	}
+
+	if err := setConfigValue(cfg, "providers.codex.auth_mode", "invalid"); err == nil {
+		t.Fatal("expected error for invalid auth_mode")
 	}
 }
 

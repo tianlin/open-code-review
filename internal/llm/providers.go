@@ -9,10 +9,11 @@ import (
 type Provider struct {
 	Name        string
 	DisplayName string
-	Protocol    string // "anthropic" or "openai"
+	Protocol    string // "anthropic", "openai", or "responses"
 	BaseURL     string
 	AuthHeader  string // Anthropic-only; empty for OpenAI-compatible
 	EnvVar      string // environment variable name for API key fallback
+	AuthMode    string // "api_key" or "chatgpt"
 	Models      []string
 }
 
@@ -37,6 +38,30 @@ var registry = []Provider{
 		Protocol:    "openai",
 		BaseURL:     "https://api.openai.com/v1",
 		EnvVar:      "OPENAI_API_KEY",
+		Models: []string{
+			"gpt-5.5",
+			"gpt-5.4",
+			"gpt-5.4-mini",
+		},
+	},
+	{
+		Name:        "openai-responses",
+		DisplayName: "OpenAI Responses API",
+		Protocol:    "responses",
+		BaseURL:     "https://api.openai.com/v1",
+		EnvVar:      "OPENAI_API_KEY",
+		Models: []string{
+			"gpt-5.5",
+			"gpt-5.4",
+			"gpt-5.4-mini",
+		},
+	},
+	{
+		Name:        "codex",
+		DisplayName: "Codex ChatGPT Auth",
+		Protocol:    "responses",
+		BaseURL:     "https://chatgpt.com/backend-api/codex",
+		AuthMode:    "chatgpt",
 		Models: []string{
 			"gpt-5.5",
 			"gpt-5.4",
