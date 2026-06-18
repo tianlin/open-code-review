@@ -398,6 +398,84 @@ func TestResolveEndpoint_CustomProviderResponsesProtocol(t *testing.T) {
 	}
 }
 
+func TestResolveEndpoint_RejectsChatGPTAuthForNonResponsesProtocol(t *testing.T) {
+	clearAllEnv(t)
+
+	cfg := configFile{
+		Provider: "openai",
+		Providers: map[string]providerEntryConfig{
+			"openai": {
+				Model:    "gpt-5.5",
+				AuthMode: "chatgpt",
+			},
+		},
+	}
+	data, _ := json.Marshal(cfg)
+	cfgPath := filepath.Join(t.TempDir(), "config.json")
+	os.WriteFile(cfgPath, data, 0644)
+
+	_, err := ResolveEndpoint(cfgPath)
+	if err == nil {
+		t.Fatal("ResolveEndpoint succeeded, want chatgpt auth protocol error")
+	}
+	if !strings.Contains(err.Error(), "auth_mode chatgpt requires protocol responses") {
+		t.Fatalf("error = %v, want protocol responses guardrail", err)
+	}
+}
+
+func TestResolveEndpoint_RejectsChatGPTAuthForCustomProvider(t *testing.T) {
+	clearAllEnv(t)
+
+	cfg := configFile{
+		Provider: "custom-codex",
+		CustomProviders: map[string]providerEntryConfig{
+			"custom-codex": {
+				URL:      "https://chatgpt.com/backend-api/codex",
+				Protocol: "responses",
+				Model:    "gpt-5.5",
+				AuthMode: "chatgpt",
+			},
+		},
+	}
+	data, _ := json.Marshal(cfg)
+	cfgPath := filepath.Join(t.TempDir(), "config.json")
+	os.WriteFile(cfgPath, data, 0644)
+
+	_, err := ResolveEndpoint(cfgPath)
+	if err == nil {
+		t.Fatal("ResolveEndpoint succeeded, want custom provider chatgpt auth error")
+	}
+	if !strings.Contains(err.Error(), `auth_mode chatgpt is only supported by the built-in "codex" provider`) {
+		t.Fatalf("error = %v, want codex provider guardrail", err)
+	}
+}
+
+func TestResolveEndpoint_RejectsChatGPTAuthForCodexProviderWithUnexpectedHost(t *testing.T) {
+	clearAllEnv(t)
+
+	cfg := configFile{
+		Provider: "codex",
+		Providers: map[string]providerEntryConfig{
+			"codex": {
+				URL:      "https://proxy.example.com/backend-api/codex",
+				Model:    "gpt-5.5",
+				AuthMode: "chatgpt",
+			},
+		},
+	}
+	data, _ := json.Marshal(cfg)
+	cfgPath := filepath.Join(t.TempDir(), "config.json")
+	os.WriteFile(cfgPath, data, 0644)
+
+	_, err := ResolveEndpoint(cfgPath)
+	if err == nil {
+		t.Fatal("ResolveEndpoint succeeded, want chatgpt auth host error")
+	}
+	if !strings.Contains(err.Error(), "auth_mode chatgpt requires the Codex ChatGPT host") {
+		t.Fatalf("error = %v, want host guardrail", err)
+	}
+}
+
 func TestResolveEndpoint_ProviderModelOverride(t *testing.T) {
 	clearAllEnv(t)
 

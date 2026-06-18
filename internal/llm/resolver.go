@@ -3,6 +3,7 @@ package llm
 import (
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -222,6 +223,17 @@ func tryProviderConfig(cfg configFile, modelOverride string) (ResolvedEndpoint, 
 	}
 	if !validAuthMode(authMode) {
 		return ResolvedEndpoint{}, false, fmt.Errorf("provider %q has invalid auth_mode %q: must be \"api_key\" or \"chatgpt\"", cfg.Provider, authMode)
+	}
+	if authMode == "chatgpt" {
+		if protocol != "responses" {
+			return ResolvedEndpoint{}, false, fmt.Errorf("provider %q auth_mode chatgpt requires protocol responses, got %q", cfg.Provider, protocol)
+		}
+		if !isPreset || cfg.Provider != "codex" {
+			return ResolvedEndpoint{}, false, fmt.Errorf("provider %q auth_mode chatgpt is only supported by the built-in \"codex\" provider", cfg.Provider)
+		}
+		if !isCodexChatGPTURL(url) {
+			return ResolvedEndpoint{}, false, fmt.Errorf("provider %q auth_mode chatgpt requires the Codex ChatGPT host", cfg.Provider)
+		}
 	}
 
 	apiKey := entry.APIKey
@@ -486,6 +498,16 @@ func validAuthMode(authMode string) bool {
 	default:
 		return false
 	}
+}
+
+func isCodexChatGPTURL(rawURL string) bool {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return false
+	}
+	return strings.EqualFold(u.Scheme, "https") &&
+		strings.EqualFold(u.Hostname(), "chatgpt.com") &&
+		strings.HasPrefix(strings.TrimRight(u.Path, "/"), "/backend-api/codex")
 }
 
 type chatGPTAuthFile struct {

@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	anthropic "github.com/anthropics/anthropic-sdk-go"
 )
@@ -203,6 +204,116 @@ func TestResponsesClient_RequestAndTextOutput(t *testing.T) {
 	}
 }
 
+func TestResponsesClient_APIKeyRequestsNonStreamingByDefault(t *testing.T) {
+	var gotBody map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&gotBody); err != nil {
+			t.Fatalf("decode request body: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp_test","model":"gpt-5.5","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"ok"}]}]}`))
+	}))
+	defer server.Close()
+
+	client := NewResponsesClient(ClientConfig{
+		URL:    server.URL + "/v1",
+		APIKey: "token",
+		Model:  "gpt-5.5",
+	})
+	_, err := client.CompletionsWithCtx(context.Background(), ChatRequest{Messages: []Message{{Role: "user", Content: "ping"}}})
+	if err != nil {
+		t.Fatalf("CompletionsWithCtx: %v", err)
+	}
+	if gotBody["stream"] != false {
+		t.Errorf("stream = %v, want false", gotBody["stream"])
+	}
+}
+
+func TestResponsesClient_EventStreamReturnsOnCompletedWithoutEOF(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			t.Fatal("response writer cannot flush")
+		}
+		_, _ = w.Write([]byte("event: response.output_text.delta\n"))
+		_, _ = w.Write([]byte(`data: {"type":"response.output_text.delta","delta":"stream ok"}` + "\n\n"))
+		_, _ = w.Write([]byte("event: response.completed\n"))
+		_, _ = w.Write([]byte(`data: {"type":"response.completed","response":{"id":"resp_stream","model":"gpt-5.5","status":"completed","output":[]}}` + "\n\n"))
+		flusher.Flush()
+		<-r.Context().Done()
+	}))
+	defer server.Close()
+
+	client := NewResponsesClient(ClientConfig{
+		URL:      server.URL + "/v1",
+		APIKey:   "token",
+		Model:    "gpt-5.5",
+		AuthMode: "chatgpt",
+		Timeout:  5 * time.Second,
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	resp, err := client.CompletionsWithCtx(ctx, ChatRequest{Messages: []Message{{Role: "user", Content: "ping"}}})
+	if err != nil {
+		t.Fatalf("CompletionsWithCtx: %v", err)
+	}
+	if resp.Content() != "stream ok" {
+		t.Errorf("Content() = %q, want stream ok", resp.Content())
+	}
+}
+
+func TestResponsesClient_RejectsFailedStatusResponse(t *testing.T) {
+	raw := []byte(`{
+		"id":"resp_failed",
+		"model":"gpt-5.5",
+		"status":"failed",
+		"error":{"message":"backend rejected request"}
+	}`)
+
+	_, err := mapResponsesResponse(raw)
+	if err == nil {
+		t.Fatal("mapResponsesResponse succeeded, want failed status error")
+	}
+	if !strings.Contains(err.Error(), "responses API failed") {
+		t.Fatalf("error = %v, want responses API failed", err)
+	}
+}
+
+func TestResponsesClient_RejectsIncompleteStatusResponse(t *testing.T) {
+	raw := []byte(`{
+		"id":"resp_incomplete",
+		"model":"gpt-5.5",
+		"status":"incomplete",
+		"incomplete_details":{"reason":"max_output_tokens"}
+	}`)
+
+	_, err := mapResponsesResponse(raw)
+	if err == nil {
+		t.Fatal("mapResponsesResponse succeeded, want incomplete status error")
+	}
+	if !strings.Contains(err.Error(), "responses API incomplete") {
+		t.Fatalf("error = %v, want responses API incomplete", err)
+	}
+}
+
+func TestResponsesClient_RejectsNonCompletedStatusWithoutOutput(t *testing.T) {
+	raw := []byte(`{
+		"id":"resp_queued",
+		"model":"gpt-5.5",
+		"status":"queued",
+		"output":[]
+	}`)
+
+	_, err := mapResponsesResponse(raw)
+	if err == nil {
+		t.Fatal("mapResponsesResponse succeeded, want non-completed status error")
+	}
+	if !strings.Contains(err.Error(), `unexpected status "queued"`) {
+		t.Fatalf("error = %v, want queued status", err)
+	}
+}
+
 func TestResponsesClient_MapsFunctionToolCalls(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -276,6 +387,117 @@ func TestResponsesClient_MapsStreamCompletedEvent(t *testing.T) {
 	}
 	if resp.Usage == nil || resp.Usage.TotalTokens != 3 {
 		t.Fatalf("Usage = %#v, want total 3", resp.Usage)
+	}
+}
+
+func TestResponsesClient_MapsStreamFunctionCallItemIDAliasInOrder(t *testing.T) {
+	raw := []byte(strings.Join([]string{
+		"event: response.output_item.added",
+		`data: {"type":"response.output_item.added","item":{"type":"function_call","id":"item_1","call_id":"call_1","name":"read_file"}}`,
+		"",
+		"event: response.function_call_arguments.delta",
+		`data: {"type":"response.function_call_arguments.delta","item_id":"item_1","delta":"{\"path\""}`,
+		"",
+		"event: response.output_item.added",
+		`data: {"type":"response.output_item.added","item":{"type":"function_call","id":"item_2","call_id":"call_2","name":"code_search"}}`,
+		"",
+		"event: response.function_call_arguments.delta",
+		`data: {"type":"response.function_call_arguments.delta","item_id":"item_2","delta":"{\"search_text\""}`,
+		"",
+		"event: response.function_call_arguments.delta",
+		`data: {"type":"response.function_call_arguments.delta","item_id":"item_1","delta":":\"README.md\"}"}`,
+		"",
+		"event: response.function_call_arguments.delta",
+		`data: {"type":"response.function_call_arguments.delta","item_id":"item_2","delta":":\"getvCheck\"}"}`,
+		"",
+	}, "\n"))
+
+	resp, err := mapResponsesStream(raw)
+	if err != nil {
+		t.Fatalf("mapResponsesStream: %v", err)
+	}
+	calls := resp.ToolCalls()
+	if len(calls) != 2 {
+		t.Fatalf("ToolCalls len = %d, want 2: %#v", len(calls), calls)
+	}
+	if calls[0].ID != "call_1" || calls[0].Function.Name != "read_file" || calls[0].Function.Arguments != `{"path":"README.md"}` {
+		t.Fatalf("first call = %#v", calls[0])
+	}
+	if calls[1].ID != "call_2" || calls[1].Function.Name != "code_search" || calls[1].Function.Arguments != `{"search_text":"getvCheck"}` {
+		t.Fatalf("second call = %#v", calls[1])
+	}
+}
+
+func TestResponsesClient_PreservesRawOutputItemsForReplay(t *testing.T) {
+	raw := []byte(`{
+		"id":"resp_reasoning",
+		"model":"gpt-5.5",
+		"status":"completed",
+		"output":[
+			{"type":"reasoning","id":"rs_1","encrypted_content":"sealed"},
+			{"type":"function_call","id":"fc_1","call_id":"call_1","name":"read_file","arguments":"{\"path\":\"README.md\"}"}
+		]
+	}`)
+
+	resp, err := mapResponsesResponse(raw)
+	if err != nil {
+		t.Fatalf("mapResponsesResponse: %v", err)
+	}
+	if len(resp.ResponsesOutput) != 2 {
+		t.Fatalf("ResponsesOutput len = %d, want 2", len(resp.ResponsesOutput))
+	}
+
+	msgs := []Message{
+		NewTextMessage("user", "review"),
+		NewResponsesOutputMessage("", resp.ToolCalls(), resp.ResponsesOutput),
+		NewToolResultMessage("call_1", "file contents"),
+	}
+	client := NewResponsesClient(ClientConfig{URL: "https://api.example.com/v1"})
+	body, err := client.buildResponsesBody("gpt-5.5", ChatRequest{Messages: msgs})
+	if err != nil {
+		t.Fatalf("buildResponsesBody: %v", err)
+	}
+	input := body["input"].([]map[string]any)
+	if len(input) != 4 {
+		t.Fatalf("input len = %d, want user + two raw output items + tool output: %#v", len(input), input)
+	}
+	if input[1]["type"] != "reasoning" || input[1]["encrypted_content"] != "sealed" {
+		t.Fatalf("reasoning item not preserved: %#v", input[1])
+	}
+	if input[2]["type"] != "function_call" || input[2]["call_id"] != "call_1" {
+		t.Fatalf("function_call item not preserved: %#v", input[2])
+	}
+	if input[3]["type"] != "function_call_output" || input[3]["call_id"] != "call_1" {
+		t.Fatalf("tool output not preserved: %#v", input[3])
+	}
+}
+
+func TestResponsesClient_RedactsSensitiveHTTPErrorBody(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"error":{"message":"bad Bearer chatgpt-token","access_token":"secret","api_key":"sk-test","ChatGPT-Account-ID":"acct_123"}}`))
+	}))
+	defer server.Close()
+
+	client := NewResponsesClient(ClientConfig{
+		URL:       server.URL + "/v1",
+		APIKey:    "chatgpt-token",
+		Model:     "gpt-5.5",
+		AuthMode:  "chatgpt",
+		AccountID: "acct_123",
+	})
+	_, err := client.CompletionsWithCtx(context.Background(), ChatRequest{Messages: []Message{{Role: "user", Content: "ping"}}})
+	if err == nil {
+		t.Fatal("CompletionsWithCtx succeeded, want HTTP error")
+	}
+	errText := err.Error()
+	for _, secret := range []string{"chatgpt-token", "secret", "sk-test", "acct_123"} {
+		if strings.Contains(errText, secret) {
+			t.Fatalf("error leaked %q: %s", secret, errText)
+		}
+	}
+	if !strings.Contains(errText, "[REDACTED]") {
+		t.Fatalf("error = %s, want redacted marker", errText)
 	}
 }
 

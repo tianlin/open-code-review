@@ -40,10 +40,11 @@ type LLMClient interface {
 // or an array of content blocks (used by Claude for multi-part content).
 // ToolCallID is used by OpenAI-format APIs to identify which tool call this result responds to.
 type Message struct {
-	Role       string     `json:"role"`
-	Content    any        `json:"content"`                // string or []ContentBlock
-	ToolCallID string     `json:"tool_call_id,omitempty"` // OpenAI tool call identifier
-	ToolCalls  []ToolCall `json:"tool_calls,omitempty"`   // assistant tool invocations
+	Role            string            `json:"role"`
+	Content         any               `json:"content"`                // string or []ContentBlock
+	ToolCallID      string            `json:"tool_call_id,omitempty"` // OpenAI tool call identifier
+	ToolCalls       []ToolCall        `json:"tool_calls,omitempty"`   // assistant tool invocations
+	ResponsesOutput []json.RawMessage `json:"-"`                      // Raw Responses API output items for stateless replay
 }
 
 // ContentBlock represents a single block within a multi-part message content.
@@ -62,12 +63,25 @@ func NewTextMessage(role, content string) Message {
 
 // NewToolCallMessage creates an assistant message with text content and tool invocations.
 func NewToolCallMessage(content string, toolCalls []ToolCall) Message {
+	return NewResponsesOutputMessage(content, toolCalls, nil)
+}
+
+// NewResponsesOutputMessage creates an assistant message that preserves raw
+// Responses API output items for the next stateless Responses request.
+func NewResponsesOutputMessage(content string, toolCalls []ToolCall, responsesOutput []json.RawMessage) Message {
 	var tc []ToolCall
 	if len(toolCalls) > 0 {
 		tc = make([]ToolCall, len(toolCalls))
 		copy(tc, toolCalls)
 	}
-	return Message{Role: "assistant", Content: content, ToolCalls: tc}
+	var raw []json.RawMessage
+	if len(responsesOutput) > 0 {
+		raw = make([]json.RawMessage, len(responsesOutput))
+		for i := range responsesOutput {
+			raw[i] = append(json.RawMessage(nil), responsesOutput[i]...)
+		}
+	}
+	return Message{Role: "assistant", Content: content, ToolCalls: tc, ResponsesOutput: raw}
 }
 
 // NewToolResultMessage creates a tool-role message with the given result.
@@ -137,10 +151,11 @@ type ResponseMessage struct {
 
 // ChatResponse is the parsed result of a completion request.
 type ChatResponse struct {
-	ID      string     `json:"-"`
-	Model   string     `json:"-"`
-	Choices []Choice   `json:"-"`
-	Usage   *UsageInfo `json:"-"` // Token usage extracted from API response
+	ID              string            `json:"-"`
+	Model           string            `json:"-"`
+	Choices         []Choice          `json:"-"`
+	Usage           *UsageInfo        `json:"-"` // Token usage extracted from API response
+	ResponsesOutput []json.RawMessage `json:"-"` // Raw Responses API output items for stateless replay
 }
 
 // Content extracts the text content from the first choice, falling back to reasoning content.

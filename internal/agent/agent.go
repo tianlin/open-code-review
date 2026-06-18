@@ -994,7 +994,7 @@ func (a *Agent) performLlmCodeReview(ctx context.Context, messages []llm.Message
 			consecutiveEmptyRounds = 0
 		}
 
-		succeed := a.addNextMessage(ctx, content, calls, results, &messages, newPath)
+		succeed := a.addNextMessage(ctx, content, calls, resp.ResponsesOutput, results, &messages, newPath)
 		if !succeed {
 			fmt.Fprintf(stdout.Writer(), "[ocr] Context compression exceeded threshold for %s, stopping.\n", newPath)
 			break
@@ -1146,7 +1146,7 @@ func (a *Agent) collectPendingComments() []model.LlmComment {
 // Implements dual-threshold compression:
 //   - 60% of MaxTokens: trigger async background compression (non-blocking)
 //   - 80% of MaxTokens: perform synchronous compression immediately
-func (a *Agent) addNextMessage(ctx context.Context, assistantContent string, toolCalls []llm.ToolCall, results []tool.ToolCallResult, messages *[]llm.Message, filePath string) bool {
+func (a *Agent) addNextMessage(ctx context.Context, assistantContent string, toolCalls []llm.ToolCall, responsesOutput []json.RawMessage, results []tool.ToolCallResult, messages *[]llm.Message, filePath string) bool {
 	maxAllowed := a.args.Template.MaxTokens
 	softLimit := int(float64(maxAllowed) * tokenSoftThreshold)
 	warnLimit := int(float64(maxAllowed) * tokenWarningThreshold)
@@ -1170,7 +1170,7 @@ func (a *Agent) addNextMessage(ctx context.Context, assistantContent string, too
 
 	// Add assistant message with tool_calls when present.
 	if len(toolCalls) > 0 {
-		*messages = append(*messages, llm.NewToolCallMessage(assistantContent, toolCalls))
+		*messages = append(*messages, llm.NewResponsesOutputMessage(assistantContent, toolCalls, responsesOutput))
 	} else if assistantContent != "" {
 		*messages = append(*messages, llm.NewTextMessage("assistant", assistantContent))
 	}
